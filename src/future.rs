@@ -1,7 +1,17 @@
 use std::ptr;
+use std::mem;
+
+use task::Continuation;
+use task::Task;
+use vortex::Vortex;
+
+// Baustellen:
+// 1) in der promise schedule implementieren, inklusive speichern des callbacks
+// bis der state da ist?
+
 
 #[derive(Debug,PartialEq)]
-pub enum FutureState<T, E> {
+pub enum FutureState<T: 'static, E: 'static> {
     Invalid,
     Pending,
     Ok(T),
@@ -24,8 +34,8 @@ impl<T, E> FutureState<T, E> {
     }
 }
 
-pub struct Promise<T, E> {
-    future: Option<Future<T, E>>,
+pub struct Promise<T: 'static, E: 'static> {
+    future: Option<*mut Future<T, E>>,
     state: FutureState<T, E>,
 }
 
@@ -37,12 +47,8 @@ impl<T, E> Promise<T, E> {
         }
     }
 
-    pub fn future(&mut self) -> &mut Future<T, E> {
-        if self.future.is_none() {
-            let future = Future::deferred(self);
-            self.future = Some(future);
-        }
-        self.future.as_mut().unwrap()
+    pub fn future(&mut self) -> Future<T, E> {
+        Future::deferred(self)
     }
 
     pub fn state(&self) -> &FutureState<T, E> {
@@ -55,21 +61,37 @@ impl<T, E> Promise<T, E> {
 
     pub fn set_ok(&mut self, value: T) {
         self.state = FutureState::Ok(value);
+        self.make_ready();
     }
 
     pub fn set_err(&mut self, err: E) {
         self.state = FutureState::Err(err);
+        self.make_ready();
+    }
+
+    fn schedule<F>(&mut self, f: F)
+        where F: FnMut(FutureState<T, E>) + 'static
+    {
+        // self.task = Some(Box::new(f));
+    }
+
+    fn make_ready(&mut self) {
+        // let f = mem::replace(&mut self.task, None).unwrap();
+        // let state = mem::replace(&mut self.state, FutureState::Invalid);
+        // Vortex::schedule(Box::new(Continuation::complete(state, f)))
     }
 }
 
-pub enum Future<T, E> {
+pub enum Future<T: 'static, E: 'static> {
     Deferred(*mut Promise<T, E>),
     Ready(FutureState<T, E>),
 }
 
 impl<T, E> Future<T, E> {
     pub fn deferred(promise: &mut Promise<T, E>) -> Future<T, E> {
-        Future::Deferred(promise as *mut Promise<T, E>)
+        let mut future = Future::Deferred(promise as *mut Promise<T, E>);
+        promise.future = Some(&mut future as *mut Future<T, E>);
+        future
     }
 
     pub fn from_ok(value: T) -> Future<T, E> {
@@ -99,8 +121,7 @@ impl<T, E> Future<T, E> {
                 if promise.is_null() {
                     panic!("Trying to get FutureState out of Promise where *mut is null!");
                 }
-                ptr::replace((*promise).state_mut() as *mut FutureState<T, E>,
-                             FutureState::Invalid)
+                mem::replace((*promise).state_mut(), FutureState::Invalid)
             },
         }
     }
@@ -113,8 +134,8 @@ impl<T, E> Future<T, E> {
         self.state_as_ref().failed()
     }
 
-    pub fn then<F, OUTT>(&mut self, f: F) -> Future<OUTT, E>
-        where F: Fn(T) -> Future<OUTT, E>
+    pub fn then<F, TRES>(&mut self, f: F) -> Future<TRES, E>
+        where F: Fn(T) -> Future<TRES, E> + 'static
     {
         if self.available() {
             match self.state() {
@@ -123,20 +144,57 @@ impl<T, E> Future<T, E> {
                 _ => panic!("This should not happen since we checked the state before."),
             }
         }
-        panic!("Non-available handling not implemented yet!")
+
+        let mut promise = Promise::<TRES, E>::new();
+        let mut future = promise.future();
+
+        self.schedule(move |state| {
+            match state {
+                FutureState::Ok(v) => {
+                    match f(v).state() {
+                        FutureState::Ok(iv) => promise.set_ok(iv),
+                        FutureState::Err(ie) => promise.set_err(ie),
+                        _ => panic!("This should not happen since we checked the state before."),
+                    }
+                }
+                FutureState::Err(e) => promise.set_err(e),
+                _ => panic!("This should not happen since we checked the state before."),
+            }
+        });
+
+        future
     }
 
     pub fn then_wrapped<F, TRES>(&mut self, f: F) -> Future<TRES, E>
-        where F: Fn(FutureState<T, E>) -> Future<TRES, E>
+        where F: Fn(FutureState<T, E>) -> Future<TRES, E> + 'static
     {
         if self.available() {
             return f(self.state());
         }
-        panic!("Non-available handling not implemented yet!")
+
+
+        let mut promise = Promise::<TRES, E>::new();
+        let mut future = promise.future();
+
+        self.schedule(move |state| {
+            match f(state).state() {
+                FutureState::Ok(iv) => promise.set_ok(iv),
+                FutureState::Err(ie) => promise.set_err(ie),
+                _ => panic!("This should not happen since we checked the state before."),
+            }
+        });
+
+        future
     }
 
-    // TODO: next up implement non-ready future handling & promise completion
-    // TODO: back implement the event loop and run a full example
+    fn schedule<F>(&mut self, f: F)
+        where F: FnMut(FutureState<T, E>) + 'static
+    {
+        match *self {
+            Future::Ready(_) => Vortex::schedule(Box::new(Continuation::complete(self.state(), f))),
+            Future::Deferred(promise) => unsafe { (*promise).schedule(f) },
+        }
+    }
 }
 
 #[cfg(test)]
