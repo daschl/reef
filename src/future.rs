@@ -5,11 +5,6 @@ use task::Continuation;
 use task::Task;
 use vortex::Vortex;
 
-// Baustellen:
-// 1) in der promise schedule implementieren, inklusive speichern des callbacks
-// bis der state da ist?
-
-
 #[derive(Debug,PartialEq)]
 pub enum FutureState<T: 'static, E: 'static> {
     Invalid,
@@ -37,6 +32,8 @@ impl<T, E> FutureState<T, E> {
 pub struct Promise<T: 'static, E: 'static> {
     future: Option<*mut Future<T, E>>,
     state: FutureState<T, E>,
+    task: Option<Box<Task>>,
+    task_state: Option<*mut Option<FutureState<T, E>>>,
 }
 
 impl<T, E> Promise<T, E> {
@@ -44,6 +41,8 @@ impl<T, E> Promise<T, E> {
         Promise {
             future: None,
             state: FutureState::Pending,
+            task: None,
+            task_state: None,
         }
     }
 
@@ -52,33 +51,48 @@ impl<T, E> Promise<T, E> {
     }
 
     pub fn state(&self) -> &FutureState<T, E> {
-        &self.state
+        match self.task_state {
+            Some(ptr) => unsafe { (*ptr).as_ref().unwrap() },
+            None => &self.state,
+        }
     }
 
     pub fn state_mut(&mut self) -> &mut FutureState<T, E> {
-        &mut self.state
+        match self.task_state {
+            Some(ptr) => unsafe { (*ptr).as_mut().unwrap() },
+            None => &mut self.state,
+        }
     }
 
     pub fn set_ok(&mut self, value: T) {
-        self.state = FutureState::Ok(value);
+        match self.task_state {
+            Some(ptr) => unsafe { *ptr = Some(FutureState::Ok(value)) },
+            None => self.state = FutureState::Ok(value),
+        };
         self.make_ready();
     }
 
     pub fn set_err(&mut self, err: E) {
-        self.state = FutureState::Err(err);
+        match self.task_state {
+            Some(ptr) => unsafe { *ptr = Some(FutureState::Err(err)) },
+            None => self.state = FutureState::Err(err),
+        };
         self.make_ready();
     }
 
     fn schedule<F>(&mut self, f: F)
         where F: FnMut(FutureState<T, E>) + 'static
     {
-        // self.task = Some(Box::new(f));
+        let mut boxed = Box::new(Continuation::deferred(f));
+        self.task_state = Some(boxed.state_as_mut());
+        self.task = Some(boxed);
     }
 
     fn make_ready(&mut self) {
-        // let f = mem::replace(&mut self.task, None).unwrap();
-        // let state = mem::replace(&mut self.state, FutureState::Invalid);
-        // Vortex::schedule(Box::new(Continuation::complete(state, f)))
+        if self.task.is_some() {
+            let task = mem::replace(&mut self.task, None).unwrap();
+            Vortex::schedule(task);
+        }
     }
 }
 
@@ -145,8 +159,8 @@ impl<T, E> Future<T, E> {
             }
         }
 
-        let mut promise = Promise::<TRES, E>::new();
-        let mut future = promise.future();
+        let mut promise = Box::new(Promise::<TRES, E>::new());
+        let future = promise.future();
 
         self.schedule(move |state| {
             match state {

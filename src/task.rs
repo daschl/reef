@@ -19,6 +19,17 @@ impl<T, E, F> Continuation<T, E, F>
             func: func,
         }
     }
+
+    pub fn deferred(func: F) -> Continuation<T, E, F> {
+        Continuation {
+            state: None,
+            func: func,
+        }
+    }
+
+    pub fn state_as_mut(&mut self) -> &mut Option<FutureState<T, E>> {
+        &mut self.state
+    }
 }
 
 impl<T, E, F> Task for Continuation<T, E, F>

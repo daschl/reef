@@ -45,21 +45,21 @@ impl Vortex {
                 }
             }
 
-            while let Some(mut task) = self.task_queue.borrow_mut().pop_back() {
+            while let Some(mut task) = self.pop_task() {
                 task.run();
             }
         }
     }
 
-    fn add_task<T>(&self, task: Box<T>)
-        where T: Task + 'static
-    {
+    fn pop_task(&self) -> Option<Box<Task>> {
+        self.task_queue.borrow_mut().pop_back()
+    }
+
+    fn add_task(&self, task: Box<Task>) {
         self.task_queue.borrow_mut().push_front(task);
     }
 
-    pub fn schedule<T>(task: Box<T>)
-        where T: Task + 'static
-    {
+    pub fn schedule(task: Box<Task>) {
         TL_VT.with(|s| s.borrow().as_ref().unwrap().add_task(task));
     }
 }
