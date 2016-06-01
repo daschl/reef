@@ -2,6 +2,7 @@ use std::collections::vec_deque::VecDeque;
 use std::cell::RefCell;
 use std::sync::mpsc::Receiver;
 use task::Task;
+use future::Promise;
 
 thread_local! { pub static TL_VT: RefCell<Option<Vortex>> = RefCell::new(None) }
 
@@ -12,13 +13,15 @@ pub enum ControlMsg {
 pub struct Vortex {
     control: RefCell<Receiver<ControlMsg>>,
     task_queue: RefCell<VecDeque<Box<Task>>>,
+    start_promise: RefCell<Promise<(), ()>>,
 }
 
 impl Vortex {
-    pub fn init(control: Receiver<ControlMsg>) {
+    pub fn init(control: Receiver<ControlMsg>, start_promise: Promise<(), ()>) {
         let vortex = Vortex {
             control: RefCell::new(control),
             task_queue: RefCell::new(VecDeque::new()),
+            start_promise: RefCell::new(start_promise),
         };
 
         TL_VT.with(|s| {
@@ -37,6 +40,10 @@ impl Vortex {
     }
 
     fn run(&self) {
+        // Additional Start logic goes here.
+
+        self.start_promise.borrow_mut().set_ok(());
+
         loop {
             let control_msg = self.control.borrow().try_recv();
             if control_msg.is_ok() {

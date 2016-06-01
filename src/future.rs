@@ -187,8 +187,8 @@ impl<T, E> Future<T, E> {
         }
 
 
-        let mut promise = Promise::<TRES, E>::new();
-        let mut future = promise.future();
+        let mut promise = Box::new(Promise::<TRES, E>::new());
+        let future = promise.future();
 
         self.schedule(move |state| {
             match f(state).state() {
