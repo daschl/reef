@@ -1,14 +1,18 @@
 extern crate reef;
 
-use reef::vortex::Vortex;
-use reef::vortex::ControlMsg;
-use reef::future::Promise;
-use reef::future::Future;
+use reef::vortex::{Vortex, ControlMsg};
+use reef::future::{Promise, ok};
 
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use std::sync::mpsc::channel;
+
+#[derive(Debug)]
+struct User {
+    name: &'static str,
+    age: i32,
+}
 
 fn main() {
     let (tx, rx) = channel();
@@ -19,15 +23,21 @@ fn main() {
         let mut start_promise = Promise::<(), ()>::new();
 
         start_promise.future()
-            .then(|()| {
-                println!("CONNECTED!");
-                let val = 42;
-                Future::from_ok(format!("My Age is: {}", val))
+            .then(|_| {
+                println!("Connected :)");
+                ok(42)
             })
-            .then(|val| {
-                println!("Second cb: {}", val);
-                Future::from_ok(())
+            .then(|age| {
+                ok(User {
+                    name: "Michael",
+                    age: age,
+                })
+            })
+            .then(|user| {
+                println!("{:?}", user);
+                ok(())
             });
+
 
         // Initialize the Vortex
         Vortex::init(rx, start_promise);

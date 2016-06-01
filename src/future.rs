@@ -211,6 +211,14 @@ impl<T, E> Future<T, E> {
     }
 }
 
+pub fn ok<T, E>(value: T) -> Future<T, E> {
+    Future::from_ok(value)
+}
+
+pub fn err<T, E>(err: E) -> Future<T, E> {
+    Future::from_err(err)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -370,7 +378,7 @@ mod tests {
                 assert_eq!(42, val);
                 Future::<i32, i32>::from_err(-1)
             })
-            .then(|val| {
+            .then(|_| {
                 assert!(false);
                 Future::<(), i32>::from_ok(())
             })
