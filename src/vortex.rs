@@ -4,7 +4,7 @@ use std::sync::mpsc::Receiver;
 use task::Task;
 use future::Promise;
 
-thread_local! { pub static TL_VT: RefCell<Option<Vortex>> = RefCell::new(None) }
+thread_local! { static TL_VT: RefCell<Option<Vortex>> = RefCell::new(None) }
 
 pub enum ControlMsg {
     Stop,
