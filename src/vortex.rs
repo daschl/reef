@@ -39,6 +39,11 @@ impl Vortex {
         });
     }
 
+    #[inline]
+    pub fn schedule(task: Box<Task>) {
+        TL_VT.with(|s| s.borrow().as_ref().unwrap().push_task(task));
+    }
+
     fn run(&self) {
         // Additional Start logic goes here.
 
@@ -58,15 +63,13 @@ impl Vortex {
         }
     }
 
+    #[inline]
     fn pop_task(&self) -> Option<Box<Task>> {
         self.task_queue.borrow_mut().pop_back()
     }
 
-    fn add_task(&self, task: Box<Task>) {
+    #[inline]
+    fn push_task(&self, task: Box<Task>) {
         self.task_queue.borrow_mut().push_front(task);
-    }
-
-    pub fn schedule(task: Box<Task>) {
-        TL_VT.with(|s| s.borrow().as_ref().unwrap().add_task(task));
     }
 }

@@ -1,3 +1,3 @@
-pub mod task;
+mod task;
 pub mod future;
 pub mod vortex;

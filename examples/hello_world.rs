@@ -23,17 +23,17 @@ fn main() {
         let mut start_promise = Promise::<(), ()>::new();
 
         start_promise.future()
-            .then(|_| {
+            .map(|_| {
                 println!("Connected :)");
                 ok(42)
             })
-            .then(|age| {
+            .map(|age| {
                 ok(User {
                     name: "Michael",
                     age: age,
                 })
             })
-            .then(|user| {
+            .map(|user| {
                 println!("{:?}", user);
                 ok(())
             });

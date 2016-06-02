@@ -1,4 +1,4 @@
-//! Basic concurrency building blocks (Futures and Promises).
+//! Main concurrency building blocks (Futures and Promises).
 //!
 //! # Overview
 //!
@@ -92,16 +92,16 @@ impl<T, E> FutureState<T, E> {
     /// use reef::future::FutureState;
     ///
     /// let state = FutureState::Pending::<i32, i32>;
-    /// assert_eq!(false, state.is_available());
+    /// assert_eq!(false, state.is_ready());
     ///
     /// let state = FutureState::Err::<i32, _>(-1);
-    /// assert_eq!(true, state.is_available());
+    /// assert_eq!(true, state.is_ready());
     ///
     /// let state = FutureState::Ok::<_, i32>(1);
-    /// assert_eq!(true, state.is_available());
+    /// assert_eq!(true, state.is_ready());
     /// ```
     #[inline]
-    pub fn is_available(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.is_ok() || self.is_err()
     }
 }
@@ -113,12 +113,7 @@ impl<T, E> FutureState<T, E> {
 /// relationships are established between them.
 ///
 /// If a `Task` (a `Continuation`) has been attached already then all state which is set through
-/// either the `set_ok` or the `set_err` methods is delivered into the task. If no task has been
-/// set yet the state is carried over properly and executed.
-///
-/// **Note:** The unsafe code is there since, frankly, I don't right now how to get it done in a
-/// straightforward way with stable rust. This might change in the future but does not change
-/// the semantics of the Future/Promise relationship by any means.
+/// either the `set_ok` or the `set_err` methods is delivered into the task.
 pub struct Promise<T: 'static, E: 'static> {
     future: Option<*mut Future<T, E>>,
     state: FutureState<T, E>,
@@ -127,6 +122,20 @@ pub struct Promise<T: 'static, E: 'static> {
 }
 
 impl<T, E> Promise<T, E> {
+    /// Create a new `Promise`.
+    ///
+    /// **Important:** If you want to move out the future later on, keep in mind to Box it before
+    /// calling `future()`, otherwise the unsafe pointers will move and you'll get a segfault. Once
+    /// all the unsafe code is removed hopefully this will be handled better.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_ref());
+    /// ```
     #[inline]
     pub fn new() -> Promise<T, E> {
         Promise {
@@ -137,132 +146,309 @@ impl<T, E> Promise<T, E> {
         }
     }
 
+    /// Creates a `Future` and links it with this `Promise`.
+    ///
+    /// **Important:** Make sure that the promise is boxed before calling `future` if you want
+    /// to move the promise out of the stack, otherwise the unsafe pointers get screwed and
+    /// you end up with a segfaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let mut promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_ref());
+    ///
+    /// let future = promise.future();
+    /// assert_eq!(false, future.is_ready());
+    /// ```
     #[inline]
     pub fn future(&mut self) -> Future<T, E> {
         Future::deferred(self)
     }
 
+    /// Returns the current state of the `Promise` (which mirrors the state of the `Future`) as a
+    /// immutable reference.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let mut promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_ref());
+    /// ```
     #[inline]
-    pub fn state(&self) -> &FutureState<T, E> {
-        match self.task_state {
-            Some(ptr) => unsafe { (*ptr).as_ref().unwrap() },
-            None => &self.state,
-        }
+    pub fn state_ref(&self) -> &FutureState<T, E> {
+        self.task_state.map_or(&self.state, |ptr| {
+            unsafe { (*ptr).as_ref().expect("Task State Pointer is null!") }
+        })
     }
 
+    /// Returns the current state of the `Promise` (which mirrors the state of the `Future`) as a
+    /// mutable reference.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let mut promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_mut());
+    /// ```
     #[inline]
     pub fn state_mut(&mut self) -> &mut FutureState<T, E> {
-        match self.task_state {
-            Some(ptr) => unsafe { (*ptr).as_mut().unwrap() },
-            None => &mut self.state,
-        }
+        self.task_state.map_or(&mut self.state, |ptr| {
+            unsafe { (*ptr).as_mut().expect("Task State Pointer is null!") }
+        })
     }
 
+    /// Sets the value on the Promise (completing the Future), scheduling the stored task as a
+    /// side-effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let mut promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_ref());
+    ///
+    /// let future = promise.future();
+    /// assert_eq!(false, future.is_ready());
+    ///
+    /// promise.set_ok(42);
+    /// assert_eq!(FutureState::Ok(42), *promise.state_ref());
+    /// assert_eq!(true, future.is_ready());
+    /// assert_eq!(false, future.is_err());
+    /// ```
     #[inline]
     pub fn set_ok(&mut self, value: T) {
         match self.task_state {
             Some(ptr) => unsafe { *ptr = Some(FutureState::Ok(value)) },
             None => self.state = FutureState::Ok(value),
         };
-        self.make_ready();
+        self.schedule();
     }
 
+    /// Sets the error on the Promise (completing the Future), scheduling the stored task as a
+    /// side-effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{FutureState, Promise};
+    ///
+    /// let mut promise = Box::new(Promise::<i32, i32>::new());
+    /// assert_eq!(FutureState::Pending, *promise.state_ref());
+    ///
+    /// let future = promise.future();
+    /// assert_eq!(false, future.is_ready());
+    ///
+    /// promise.set_err(-1);
+    /// assert_eq!(FutureState::Err(-1), *promise.state_ref());
+    /// assert_eq!(true, future.is_ready());
+    /// assert_eq!(true, future.is_err());
+    /// ```
     #[inline]
     pub fn set_err(&mut self, err: E) {
         match self.task_state {
             Some(ptr) => unsafe { *ptr = Some(FutureState::Err(err)) },
             None => self.state = FutureState::Err(err),
         };
-        self.make_ready();
+        self.schedule();
     }
 
+    /// Stores the closure in a Task for later scheduling.
     #[inline]
-    fn schedule<F>(&mut self, f: F)
+    fn store_task<F>(&mut self, f: F)
         where F: FnMut(FutureState<T, E>) + 'static
     {
-        let mut boxed = Box::new(Continuation::deferred(f));
-        self.task_state = Some(boxed.state_as_mut());
-        self.task = Some(boxed);
+        let mut continuation = Box::new(Continuation::deferred(f));
+        self.task_state = Some(continuation.state_as_mut());
+        self.task = Some(continuation);
     }
 
+    /// If the Task is set on this `Promise` it will be scheduled to run on the Vortex.
     #[inline]
-    fn make_ready(&mut self) {
+    fn schedule(&mut self) {
         if self.task.is_some() {
-            let task = mem::replace(&mut self.task, None).unwrap();
+            let task = mem::replace(&mut self.task, None)
+                .expect("Task is None even if checked right before.");
             Vortex::schedule(task);
         }
     }
 }
 
+/// Represents a result which may be completed at some point (or is already).
+///
+/// If a `Future` is initialized with a `Promise` it starts in a Deferred state. If it is
+/// initialized from either a value or an error it immediately goes into `Ready` state. A
+/// `Ready` future maintains its own `FutureState` while a `Deferred` one keeps the state
+/// inside the linked `Promise`.
 pub enum Future<T: 'static, E: 'static> {
+    /// The Future is not yet completed and depends on a Promise for state.
     Deferred(*mut Promise<T, E>),
+    /// The Future is already completed and carries its own state.
     Ready(FutureState<T, E>),
 }
 
 impl<T, E> Future<T, E> {
+    /// Create a deferred Future, depending on a Promise.
+    ///
+    /// This method should not be called directly by the user but instead it is used when
+    /// `future()` on the `Promise` is called.
     #[inline]
-    pub fn deferred(promise: &mut Promise<T, E>) -> Future<T, E> {
+    fn deferred(promise: &mut Promise<T, E>) -> Future<T, E> {
         let mut future = Future::Deferred(promise as *mut Promise<T, E>);
         promise.future = Some(&mut future as *mut Future<T, E>);
         future
     }
 
+    /// Creates a `Future` which is ready and has been completed with a value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::Future;
+    ///
+    /// let future = Future::<i32, i32>::from_ok(42);
+    /// assert_eq!(true, future.is_ready());
+    /// assert_eq!(true, future.is_ok());
+    /// assert_eq!(false, future.is_err());
+    /// ```
     #[inline]
     pub fn from_ok(value: T) -> Future<T, E> {
         Future::Ready(FutureState::Ok(value))
     }
 
+    /// Creates a `Future` which is ready and has been completed with an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::Future;
+    ///
+    /// let future = Future::<i32, i32>::from_err(-1);
+    /// assert_eq!(true, future.is_ready());
+    /// assert_eq!(false, future.is_ok());
+    /// assert_eq!(true, future.is_err());
+    /// ```
     #[inline]
     pub fn from_err(error: E) -> Future<T, E> {
         Future::Ready(FutureState::Err(error))
     }
 
+    /// Returns the underlying `FutureState` as a immutable reference.
+    ///
+    /// **Note:** depending on if deferred or ready the state is either extracted from the
+    /// linked promise or directly from the locally stored state.
     #[inline]
-    fn state_as_ref(&self) -> &FutureState<T, E> {
+    fn state_ref(&self) -> &FutureState<T, E> {
         match *self {
             Future::Ready(ref state) => &state,
             Future::Deferred(promise) => unsafe {
-                if promise.is_null() {
-                    panic!("Trying to get FutureState out of Promise where *mut is null!");
-                }
-                (*promise).state()
+                promise.as_ref().expect("State in deferred Future is null").state_ref()
             },
         }
     }
 
+    /// Returns the underlying `FutureState` with ownership and invalidates the state on the
+    /// called instance.
+    ///
+    /// **Note:** depending on if deferred or ready the state is either extracted from the
+    /// linked promise or directly from the locally stored state.
     #[inline]
     fn state(&mut self) -> FutureState<T, E> {
         match *self {
             Future::Ready(ref mut state) => unsafe { ptr::replace(state, FutureState::Invalid) },
             Future::Deferred(promise) => unsafe {
-                if promise.is_null() {
-                    panic!("Trying to get FutureState out of Promise where *mut is null!");
-                }
-                mem::replace((*promise).state_mut(), FutureState::Invalid)
+                let state = promise.as_mut()
+                    .expect("State in deferred Future is null")
+                    .state_mut();
+                mem::replace(state, FutureState::Invalid)
             },
         }
     }
 
+    /// Returns true if this `Future` is ready (either errored or successful).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::Future;
+    ///
+    /// let future = Future::<i32, i32>::from_err(-1);
+    /// assert_eq!(true, future.is_ready());
+    /// ```
     #[inline]
-    pub fn is_available(&self) -> bool {
-        self.state_as_ref().is_available()
+    pub fn is_ready(&self) -> bool {
+        self.state_ref().is_ready()
     }
 
+    /// Returns true if this `Future` is ready and has failed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::Future;
+    ///
+    /// let future = Future::<i32, i32>::from_err(-1);
+    /// assert_eq!(true, future.is_err());
+    /// ```
     #[inline]
     pub fn is_err(&self) -> bool {
-        self.state_as_ref().is_err()
+        self.state_ref().is_err()
     }
 
+    /// Returns true if this `Future` is ready and is successful.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::Future;
+    ///
+    /// let future = Future::<i32, i32>::from_ok(42);
+    /// assert_eq!(true, future.is_ok());
+    /// ```
     #[inline]
     pub fn is_ok(&self) -> bool {
-        self.state_as_ref().is_ok()
+        self.state_ref().is_ok()
     }
 
+    /// Attaches a closure to run when the `Future` completes.
+    ///
+    /// This method is one of the most important ones on the Future. A closure needs to be passed
+    /// in that will be called with the result of current Future. It can then perform all kinds
+    /// of operations in it but it must return another `Future` where yet another closure can
+    /// be attached.
+    ///
+    /// **Important:** This method will only be called if the Future is successful. If the Future
+    /// fails, the error handling closures will be called instead. If your closure needs to react
+    /// to both successful and failed results, use `map_state`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{Future, ok};
+    ///
+    /// let mut future = ok::<i32, i32>(42);
+    /// future
+    ///     .map(|val| {
+    ///         assert_eq!(42, val);
+    ///         ok::<String, i32>(format!("I am {} years old!", val))
+    ///     })
+    ///     .map(|val| {
+    ///         assert_eq!("I am 42 years old!", val);
+    ///         ok::<(), i32>(())
+    ///     });
+    /// ```
     #[inline]
-    pub fn then<F, TRES>(&mut self, f: F) -> Future<TRES, E>
+    pub fn map<F, TRES>(&mut self, f: F) -> Future<TRES, E>
         where F: Fn(T) -> Future<TRES, E> + 'static
     {
-        if self.is_available() {
+        if self.is_ready() {
             match self.state() {
                 FutureState::Ok(v) => return f(v),
                 FutureState::Err(e) => return Future::from_err(e),
@@ -290,14 +476,47 @@ impl<T, E> Future<T, E> {
         future
     }
 
+    /// Attaches a closure to run when the `Future` completes.
+    ///
+    /// This method is one of the most important ones on the Future. A closure needs to be passed
+    /// in that will be called with the resulting state of current Future. It can then perform all
+    /// kinds of operations in it but it must return another `Future` where yet another closure can
+    /// be attached.
+    ///
+    /// This method will be called with the `FutureState` in both the successful and failed case.
+    /// The methods on the `FutureState` are available to extract the value and check the outcome.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use reef::future::{Future, ok, err, FutureState};
+    ///
+    /// let mut future = ok::<i32, i32>(42);
+    /// future.map(|val| {
+    ///         assert_eq!(42, val);
+    ///         err::<i32, i32>(-1)
+    ///     })
+    ///     .map(|_| {
+    ///         // This will never be called!
+    ///         assert!(false);
+    ///         ok::<(), i32>(())
+    ///     })
+    ///     .map_state(|state| {
+    ///         match state {
+    ///             FutureState::Ok(_) => assert!(false),
+    ///             FutureState::Err(e) => assert_eq!(-1, e),
+    ///             _ => assert!(false),
+    ///         }
+    ///         ok::<(), i32>(())
+    ///     });
+    /// ```
     #[inline]
-    pub fn then_wrapped<F, TRES>(&mut self, f: F) -> Future<TRES, E>
+    pub fn map_state<F, TRES>(&mut self, f: F) -> Future<TRES, E>
         where F: Fn(FutureState<T, E>) -> Future<TRES, E> + 'static
     {
-        if self.is_available() {
+        if self.is_ready() {
             return f(self.state());
         }
-
 
         let mut promise = Box::new(Promise::<TRES, E>::new());
         let future = promise.future();
@@ -313,13 +532,14 @@ impl<T, E> Future<T, E> {
         future
     }
 
+    /// Schedules the Future if `Ready` or stores the Closure in the Promise if `Deferred`.
     #[inline]
     fn schedule<F>(&mut self, f: F)
         where F: FnMut(FutureState<T, E>) + 'static
     {
         match *self {
             Future::Ready(_) => Vortex::schedule(Box::new(Continuation::complete(self.state(), f))),
-            Future::Deferred(promise) => unsafe { (*promise).schedule(f) },
+            Future::Deferred(promise) => unsafe { (*promise).store_task(f) },
         }
     }
 }
@@ -335,7 +555,7 @@ impl<T, E> Future<T, E> {
 /// use reef::future::ok;
 ///
 /// let future = ok::<_, i32>(42);
-/// assert_eq!(true, future.is_available());
+/// assert_eq!(true, future.is_ready());
 /// assert_eq!(true, future.is_ok());
 /// assert_eq!(false, future.is_err());
 /// ```
@@ -355,7 +575,7 @@ pub fn ok<T, E>(value: T) -> Future<T, E> {
 /// use reef::future::err;
 ///
 /// let future = err::<i32, _>(-1);
-/// assert_eq!(true, future.is_available());
+/// assert_eq!(true, future.is_ready());
 /// assert_eq!(false, future.is_ok());
 /// assert_eq!(true, future.is_err());
 /// ```
@@ -372,36 +592,36 @@ mod tests {
     #[test]
     fn test_future_from_ok() {
         let future = Future::<i32, i32>::from_ok(42);
-        assert_eq!(true, future.is_available());
+        assert_eq!(true, future.is_ready());
         assert_eq!(false, future.is_err());
     }
 
     #[test]
     fn test_future_from_err() {
         let future = Future::<i32, i32>::from_err(-1);
-        assert_eq!(true, future.is_available());
+        assert_eq!(true, future.is_ready());
         assert_eq!(true, future.is_err());
     }
 
     #[test]
     fn test_set_promise_state_after_future() {
         let mut promise = Promise::<i32, i32>::new();
-        assert_eq!(FutureState::Pending, *promise.state());
+        assert_eq!(FutureState::Pending, *promise.state_ref());
 
         {
             let future = promise.future();
-            assert_eq!(FutureState::Pending, *future.state_as_ref());
-            assert_eq!(false, future.is_available());
+            assert_eq!(FutureState::Pending, *future.state_ref());
+            assert_eq!(false, future.is_ready());
             assert_eq!(false, future.is_err());
         }
 
         promise.set_ok(42);
-        assert_eq!(FutureState::Ok(42), *promise.state());
+        assert_eq!(FutureState::Ok(42), *promise.state_ref());
 
         {
             let future = promise.future();
-            assert_eq!(FutureState::Ok(42), *future.state_as_ref());
-            assert_eq!(true, future.is_available());
+            assert_eq!(FutureState::Ok(42), *future.state_ref());
+            assert_eq!(true, future.is_ready());
             assert_eq!(false, future.is_err());
         }
 
@@ -410,29 +630,29 @@ mod tests {
     #[test]
     fn test_future_raw_pointer_when_promise_moved() {
         let mut promise = Promise::<i32, i32>::new();
-        assert_eq!(FutureState::Pending, *promise.state());
+        assert_eq!(FutureState::Pending, *promise.state_ref());
         promise.set_ok(42);
         move_promise_here(promise);
     }
 
     fn move_promise_here(mut promise: Promise<i32, i32>) {
-        assert_eq!(FutureState::Ok(42), *promise.state());
+        assert_eq!(FutureState::Ok(42), *promise.state_ref());
 
         let future = promise.future();
-        assert_eq!(FutureState::Ok(42), *future.state_as_ref());
-        assert_eq!(true, future.is_available());
+        assert_eq!(FutureState::Ok(42), *future.state_ref());
+        assert_eq!(true, future.is_ready());
         assert_eq!(false, future.is_err());
     }
 
     #[test]
     fn test_set_promise_state_before_future() {
         let mut promise = Promise::<i32, i32>::new();
-        assert_eq!(FutureState::Pending, *promise.state());
+        assert_eq!(FutureState::Pending, *promise.state_ref());
         promise.set_ok(42);
         {
             let future = promise.future();
-            assert_eq!(FutureState::Ok(42), *future.state_as_ref());
-            assert_eq!(true, future.is_available());
+            assert_eq!(FutureState::Ok(42), *future.state_ref());
+            assert_eq!(true, future.is_ready());
             assert_eq!(false, future.is_err());
         }
     }
@@ -442,7 +662,7 @@ mod tests {
         let state = FutureState::Pending::<i32, i32>;
         assert_eq!(false, state.is_ok());
         assert_eq!(false, state.is_err());
-        assert_eq!(false, state.is_available());
+        assert_eq!(false, state.is_ready());
     }
 
     #[test]
@@ -450,7 +670,7 @@ mod tests {
         let state = FutureState::Ok::<_, i32>(1);
         assert_eq!(true, state.is_ok());
         assert_eq!(false, state.is_err());
-        assert_eq!(true, state.is_available());
+        assert_eq!(true, state.is_ready());
     }
 
     #[test]
@@ -458,13 +678,13 @@ mod tests {
         let state = FutureState::Err::<i32, _>(-1);
         assert_eq!(false, state.is_ok());
         assert_eq!(true, state.is_err());
-        assert_eq!(true, state.is_available());
+        assert_eq!(true, state.is_ready());
     }
 
     #[test]
     fn test_extracting_state_from_ready_future() {
         let mut future = Future::<i32, i32>::from_ok(42);
-        assert_eq!(true, future.is_available());
+        assert_eq!(true, future.is_ready());
         assert_eq!(false, future.is_err());
 
         let state = future.state();
@@ -474,29 +694,29 @@ mod tests {
     #[test]
     fn test_extracting_state_from_deferred_future() {
         let mut promise = Promise::<i32, i32>::new();
-        assert_eq!(FutureState::Pending, *promise.state());
+        assert_eq!(FutureState::Pending, *promise.state_ref());
 
         promise.set_ok(42);
-        assert_eq!(FutureState::Ok(42), *promise.state());
+        assert_eq!(FutureState::Ok(42), *promise.state_ref());
 
         {
             let mut future = promise.future();
             let state = future.state();
             assert_eq!(FutureState::Ok(42), state);
-            assert_eq!(FutureState::Invalid, *future.state_as_ref());
+            assert_eq!(FutureState::Invalid, *future.state_ref());
         }
 
-        assert_eq!(FutureState::Invalid, *promise.state());
+        assert_eq!(FutureState::Invalid, *promise.state_ref());
     }
 
     #[test]
     fn test_then_on_ready_future() {
         let mut future = Future::<i32, i32>::from_ok(42);
-        future.then(|val| {
+        future.map(|val| {
                 assert_eq!(42, val);
                 Future::<i32, i32>::from_ok(22)
             })
-            .then(|val| {
+            .map(|val| {
                 assert_eq!(22, val);
                 Future::<(), i32>::from_ok(())
             });
@@ -505,11 +725,11 @@ mod tests {
     #[test]
     fn test_then_wrapped_on_ready_future() {
         let mut future = Future::<i32, i32>::from_ok(42);
-        future.then(|val| {
+        future.map(|val| {
                 assert_eq!(42, val);
                 Future::<i32, i32>::from_err(-1)
             })
-            .then_wrapped(|state| {
+            .map_state(|state| {
                 match state {
                     FutureState::Ok(_) => assert!(false),
                     FutureState::Err(e) => assert_eq!(-1, e),
@@ -522,15 +742,15 @@ mod tests {
     #[test]
     fn test_ignore_then_on_err() {
         let mut future = Future::<i32, i32>::from_ok(42);
-        future.then(|val| {
+        future.map(|val| {
                 assert_eq!(42, val);
                 Future::<i32, i32>::from_err(-1)
             })
-            .then(|_| {
+            .map(|_| {
                 assert!(false);
                 Future::<(), i32>::from_ok(())
             })
-            .then_wrapped(|state| {
+            .map_state(|state| {
                 match state {
                     FutureState::Ok(_) => assert!(false),
                     FutureState::Err(e) => assert_eq!(-1, e),
