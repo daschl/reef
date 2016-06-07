@@ -5,3 +5,6 @@ authors = ["Michael Nitschinger <michael@nitschinger.at>"]
 license = "Apache-2.0"
 
 [dependencies]
+chrono = "0.2.22"
+bit-set = "0.4.0"
+linked-list = "0.0.3"
