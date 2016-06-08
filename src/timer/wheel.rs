@@ -1,14 +1,25 @@
 use chrono::{NaiveDateTime, Duration};
 use linked_list::LinkedList;
-use bit_set::BitSet;
+use bit_vec::BitVec;
 use timer::Timer;
+use std::cmp;
 
-struct TimerWheel<'a, T: 'a> {
+// todo: get it working one way or another
+// add tests to cover all kinds of stuff on insert, remove and expire
+// add benchmarks
+// refactor until happy
+
+pub struct TimerWheel<'a, T: 'a> {
     last: Duration,
     next: Duration,
     num_buckets: u32,
     buckets: Vec<LinkedList<&'a T>>,
-    non_empty_buckets: BitSet,
+    non_empty_buckets: BitVec,
+}
+
+enum RemoveAction {
+    Remove,
+    SeekForward,
 }
 
 impl<'a, T: 'a> TimerWheel<'a, T>
@@ -22,7 +33,7 @@ impl<'a, T: 'a> TimerWheel<'a, T>
         for _ in 0..num_buckets {
             buckets.push(LinkedList::new());
         }
-        let non_empty_buckets = BitSet::with_capacity(num_buckets as usize);
+        let non_empty_buckets = BitVec::from_elem(num_buckets as usize, false);
 
         TimerWheel {
             last: last,
@@ -39,7 +50,7 @@ impl<'a, T: 'a> TimerWheel<'a, T>
         let index = self.get_index(timestamp) as usize;
 
         self.buckets.get_mut(index).expect("Index out of bounds!").push_back(timer);
-        self.non_empty_buckets.insert(index);
+        self.non_empty_buckets.set(index, true);
 
         if timestamp < self.next {
             self.next = timestamp;
@@ -55,13 +66,86 @@ impl<'a, T: 'a> TimerWheel<'a, T>
         let index = self.get_index(timestamp) as usize;
 
         let list = self.buckets.get_mut(index).expect("Index out of bounds!");
-        let pos = list.iter()
-            .position(|t| *t as *const T == timer as *const T)
-            .expect("Position not found!");
-        list.remove(pos);
-        if list.is_empty() {
-            self.non_empty_buckets.remove(index);
+        {
+            let mut cursor = list.cursor();
+            loop {
+                let action = match cursor.peek_next() {
+                    Some(t) => {
+                        if *t as *const T == timer as *const T {
+                            RemoveAction::Remove
+                        } else {
+                            RemoveAction::SeekForward
+                        }
+                    }
+                    None => break,
+                };
+
+                match action {
+                    RemoveAction::Remove => {
+                        cursor.remove();
+                        break;
+                    }
+                    RemoveAction::SeekForward => cursor.seek_forward(1),
+                }
+            }
         }
+
+        if list.is_empty() {
+            self.non_empty_buckets.set(index, false);
+        }
+    }
+
+    pub fn expire(&mut self, now: NaiveDateTime) -> LinkedList<&'a T> {
+        let timestamp = TimerWheel::<T>::duration_since_epoch(now);
+        if timestamp < self.last {
+            panic!("The timestamp to expire is smaller than last!");
+        }
+
+        let mut expired = LinkedList::new();
+        let index = self.get_index(timestamp) as usize;
+
+        let skipped = self.non_empty_buckets
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .collect::<Vec<(usize, bool)>>();
+        for (i, _) in skipped {
+            let length = expired.len();
+            expired.splice(length, self.buckets.get_mut(i).expect("Expected list"));
+            self.non_empty_buckets.set(i, false);
+        }
+
+        self.last = timestamp;
+        self.next = Duration::max_value();
+
+        let mut reinsert = vec![];
+        {
+            let mut list = self.buckets.get_mut(index).unwrap();
+            while !list.is_empty() {
+                let timer = list.pop_front().unwrap();
+                if timer.expires() <= now {
+                    list.push_back(timer);
+                } else {
+                    reinsert.push(timer);
+                }
+            }
+        }
+
+        for t in &mut reinsert {
+            self.insert(t);
+        }
+
+        self.non_empty_buckets.set(index, !self.buckets.get(index).unwrap().is_empty());
+
+        if self.next == Duration::max_value() && self.non_empty_buckets.any() {
+            let list = self.buckets.get(self.last_non_empty_bucket()).unwrap();
+            for t in list.iter() {
+                self.next = cmp::min(self.next,
+                                     TimerWheel::<T>::duration_since_epoch(t.expires()));
+            }
+        }
+
+        expired
     }
 
     /// Returns the `index` for the bucket vector where the given `Duration` is located.
@@ -73,6 +157,17 @@ impl<'a, T: 'a> TimerWheel<'a, T>
             debug_assert!(index < self.num_buckets - 1);
             index
         }
+    }
+
+    #[inline]
+    fn last_non_empty_bucket(&self) -> usize {
+        let (idx, _) = self.non_empty_buckets
+            .iter()
+            .filter(|b| *b == true)
+            .enumerate()
+            .last()
+            .expect("No non-empty bucket found!");
+        idx
     }
 
     /// Returns a `Duration` since epoch for the given time point.
@@ -89,7 +184,7 @@ mod tests {
     use timer::Timer;
     use chrono::{NaiveDateTime, Duration, UTC, TimeZone};
 
-    #[derive(Debug)]
+    #[derive(Debug,PartialEq)]
     struct MyTimer {
         expires: Duration,
     }
@@ -106,12 +201,32 @@ mod tests {
         let mut wheel = TimerWheel::<MyTimer>::new();
         let index = wheel.get_index(Duration::days(3));
 
-        assert!(!wheel.non_empty_buckets.contains(index as usize));
+        assert_eq!(Some(false), wheel.non_empty_buckets.get(index as usize));
         wheel.insert(&timer);
-        assert!(wheel.non_empty_buckets.contains(index as usize));
-
+        assert_eq!(Some(true), wheel.non_empty_buckets.get(index as usize));
         wheel.remove(&timer);
-        assert!(!wheel.non_empty_buckets.contains(index as usize));
+        assert_eq!(Some(false), wheel.non_empty_buckets.get(index as usize));
+    }
+
+    #[test]
+    fn test_expire() {
+        let timer = MyTimer { expires: Duration::days(2) };
+        let mut wheel = TimerWheel::<MyTimer>::new();
+
+
+        wheel.insert(&timer);
+
+        let expired =
+            wheel.expire(NaiveDateTime::from_timestamp(Duration::days(1).num_seconds(), 0));
+
+        assert_eq!(true, expired.is_empty());
+
+        let mut expired =
+            wheel.expire(NaiveDateTime::from_timestamp(Duration::days(4).num_seconds(), 0));
+
+        assert_eq!(false, expired.is_empty());
+        assert_eq!(1, expired.len());
+        assert_eq!(timer, *expired.pop_front().unwrap());
     }
 
     #[test]
