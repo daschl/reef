@@ -1,4 +1,7 @@
 # reef
+
+Do not use this, go use [tokio](https://github.com/tokio-rs) instead :)
+
 reef is an event-driven framework which allows you to build safe and highly
 performant server application. It is (mostly) a [Rust](https://www.rust-lang.org/) port of the awesome
 [seastar](http://www.seastar-project.org/) framework which is written in C++.
